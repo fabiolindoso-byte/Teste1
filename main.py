@@ -6,6 +6,8 @@ import discord
 from discord.ext import commands
 import anthropic
 
+SUMMARY_LIMIT_DEFAULT = 100  # mensagens buscadas por padrão no !resumir
+
 load_dotenv()
 
 DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
@@ -69,6 +71,16 @@ async def ask_claude(channel_id: int, user_message: str) -> str:
     return reply
 
 
+async def _send_long(channel: discord.abc.Messageable, text: str, reference=None):
+    """Envia texto dividido em chunks de 2000 chars."""
+    chunks = [text[i : i + 2000] for i in range(0, len(text), 2000)]
+    for i, chunk in enumerate(chunks):
+        if i == 0 and reference:
+            await reference.reply(chunk)
+        else:
+            await channel.send(chunk)
+
+
 @bot.event
 async def on_ready():
     print(f"Bot conectado como {bot.user} (ID: {bot.user.id})")
@@ -84,8 +96,12 @@ async def on_message(message: discord.Message):
     if message.author == bot.user:
         return
 
-    # Processa comandos primeiro (!limpar, etc.)
+    # Processa comandos primeiro (!resumir, !limpar, etc.)
     await bot.process_commands(message)
+
+    # Ignora mensagens que são comandos do bot
+    if message.content.startswith(COMMAND_PREFIX):
+        return
 
     # Responde apenas se mencionado ou se o canal estiver na lista permitida
     mentioned = bot.user in message.mentions
@@ -111,14 +127,131 @@ async def on_message(message: discord.Message):
         except anthropic.APIError as e:
             reply = f"Erro ao contatar o Claude: {e}"
 
-    # Discord limita mensagens a 2000 caracteres
-    if len(reply) <= 2000:
-        await message.reply(reply)
-    else:
-        chunks = [reply[i : i + 2000] for i in range(0, len(reply), 2000)]
-        await message.reply(chunks[0])
-        for chunk in chunks[1:]:
-            await message.channel.send(chunk)
+    await _send_long(message.channel, reply, reference=message)
+
+
+async def _fetch_messages(
+    channel: discord.TextChannel, limit: int
+) -> list[discord.Message]:
+    """Busca as últimas `limit` mensagens do canal em ordem cronológica."""
+    msgs = []
+    async for msg in channel.history(limit=limit, oldest_first=False):
+        msgs.append(msg)
+    msgs.reverse()
+    return msgs
+
+
+def _format_messages_for_claude(messages: list[discord.Message]) -> str:
+    """Formata mensagens do Discord em texto para o Claude processar."""
+    lines = []
+    for msg in messages:
+        author = msg.author.display_name
+        timestamp = msg.created_at.strftime("%d/%m/%Y %H:%M")
+        content = msg.content or "[sem texto]"
+        if msg.attachments:
+            content += f" [anexos: {', '.join(a.filename for a in msg.attachments)}]"
+        lines.append(f"[{timestamp}] {author}: {content}")
+    return "\n".join(lines)
+
+
+async def _summarize_with_claude(raw_text: str, extra_instruction: str = "") -> str:
+    """Pede ao Claude para resumir o texto das mensagens."""
+    instruction = (
+        "Você é um assistente que resume conversas do Discord. "
+        "Abaixo estão mensagens de um canal no formato [data/hora] autor: mensagem. "
+        "Faça um resumo claro e organizado dos principais assuntos discutidos."
+    )
+    if extra_instruction:
+        instruction += f" {extra_instruction}"
+
+    prompt = f"{instruction}\n\nMensagens:\n{raw_text}"
+
+    loop = asyncio.get_event_loop()
+
+    def _call():
+        with anthropic_client.messages.stream(
+            model="claude-opus-4-6",
+            max_tokens=2048,
+            messages=[{"role": "user", "content": prompt}],
+        ) as stream:
+            return stream.get_final_message()
+
+    response = await loop.run_in_executor(None, _call)
+    return next(
+        (block.text for block in response.content if block.type == "text"), ""
+    )
+
+
+@bot.command(name="resumir")
+async def summarize_channel(ctx: commands.Context, quantidade: int = SUMMARY_LIMIT_DEFAULT):
+    """Resume as últimas mensagens do canal atual.
+
+    Uso: !resumir [quantidade]
+    Exemplo: !resumir 50  → resume as últimas 50 mensagens
+    """
+    if quantidade < 1 or quantidade > 500:
+        await ctx.send("Informe um número entre 1 e 500.")
+        return
+
+    status = await ctx.send(f"Lendo as últimas {quantidade} mensagens… ⏳")
+
+    messages = await _fetch_messages(ctx.channel, quantidade)
+
+    if not messages:
+        await status.edit(content="Nenhuma mensagem encontrada no canal.")
+        return
+
+    raw_text = _format_messages_for_claude(messages)
+
+    await status.edit(content=f"Resumindo {len(messages)} mensagens com o Claude… 🤖")
+
+    try:
+        summary = await _summarize_with_claude(raw_text)
+    except anthropic.APIError as e:
+        await status.edit(content=f"Erro ao contatar o Claude: {e}")
+        return
+
+    await status.delete()
+    header = f"**Resumo das últimas {len(messages)} mensagens de #{ctx.channel.name}:**\n\n"
+    await _send_long(ctx.channel, header + summary)
+
+
+@bot.command(name="resumir_canal")
+async def summarize_other_channel(ctx: commands.Context, canal: discord.TextChannel, quantidade: int = SUMMARY_LIMIT_DEFAULT):
+    """Resume mensagens de outro canal.
+
+    Uso: !resumir_canal #canal [quantidade]
+    Exemplo: !resumir_canal #geral 100
+    """
+    if quantidade < 1 or quantidade > 500:
+        await ctx.send("Informe um número entre 1 e 500.")
+        return
+
+    if not canal.permissions_for(ctx.guild.me).read_message_history:
+        await ctx.send(f"Não tenho permissão para ler o histórico de {canal.mention}.")
+        return
+
+    status = await ctx.send(f"Lendo as últimas {quantidade} mensagens de {canal.mention}… ⏳")
+
+    messages = await _fetch_messages(canal, quantidade)
+
+    if not messages:
+        await status.edit(content="Nenhuma mensagem encontrada nesse canal.")
+        return
+
+    raw_text = _format_messages_for_claude(messages)
+
+    await status.edit(content=f"Resumindo {len(messages)} mensagens com o Claude… 🤖")
+
+    try:
+        summary = await _summarize_with_claude(raw_text)
+    except anthropic.APIError as e:
+        await status.edit(content=f"Erro ao contatar o Claude: {e}")
+        return
+
+    await status.delete()
+    header = f"**Resumo das últimas {len(messages)} mensagens de {canal.mention}:**\n\n"
+    await _send_long(ctx.channel, header + summary)
 
 
 @bot.command(name="limpar")
