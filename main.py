@@ -254,13 +254,6 @@ async def summarize_other_channel(ctx: commands.Context, canal: discord.TextChan
     await _send_long(ctx.channel, header + summary)
 
 
-@bot.command(name="limpar")
-async def clear_history(ctx: commands.Context):
-    """Apaga o histórico de conversa do canal atual."""
-    conversation_history[ctx.channel.id].clear()
-    await ctx.send("Histórico de conversa apagado.")
-
-
 @bot.command(name="historico")
 async def show_history(ctx: commands.Context):
     """Mostra quantas mensagens estão no histórico do canal."""
