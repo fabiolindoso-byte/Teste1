@@ -80,6 +80,39 @@ def _fetch_channel(channel_id: str, quantidade: int) -> tuple[str, list[str]]:
     return name, [_format_msg(m) for m in msgs]
 
 
+def _fetch_threads(guild_id: str, channel_id: str = None, quantidade: int = 100) -> str:
+    """Busca threads ativas de um servidor, opcionalmente filtradas por canal."""
+    quantidade = min(max(1, quantidade), 100)
+
+    try:
+        data = _get(f"/guilds/{guild_id}/threads/active")
+        threads = data.get("threads", [])
+    except Exception as e:
+        return f"Erro ao buscar threads: {e}"
+
+    if channel_id:
+        threads = [t for t in threads if str(t.get("parent_id")) == str(channel_id)]
+
+    if not threads:
+        return "Nenhuma thread ativa encontrada."
+
+    parts = []
+    for thread in threads:
+        tid = thread.get("id")
+        tname = thread.get("name", tid)
+        parent_id = thread.get("parent_id", "?")
+
+        try:
+            msgs = _get(f"/channels/{tid}/messages", params={"limit": quantidade})
+            msgs.reverse()
+            lines = [f"  {_format_msg(m)}" for m in msgs]
+            parts.append(f"  [Thread: {tname} | canal: {parent_id}]\n" + "\n".join(lines))
+        except Exception as e:
+            parts.append(f"  [Thread: {tname}] Erro: {e}")
+
+    return "\n\n".join(parts)
+
+
 # ── Ferramentas MCP ───────────────────────────────────────────────────────────
 
 @mcp.tool()
@@ -160,6 +193,36 @@ def ler_canais_monitorados(quantidade: int = 100) -> str:
         resultado += user_info
 
     return resultado
+
+
+@mcp.tool()
+def ler_threads_servidor(guild_id: str, quantidade: int = 100) -> str:
+    """Lê todas as threads ativas de um servidor Discord.
+
+    Use quando o usuário quiser ver discussões em andamento nas threads,
+    identificar pendências ou acompanhar conversas paralelas.
+
+    Args:
+        guild_id: ID numérico do servidor.
+        quantidade: Quantas mensagens buscar por thread (1-100, padrão 100).
+    """
+    resultado = _fetch_threads(guild_id, quantidade=quantidade)
+    return f"=== Threads ativas do servidor {guild_id} ===\n\n{resultado}"
+
+
+@mcp.tool()
+def ler_threads_canal(guild_id: str, channel_id: str, quantidade: int = 100) -> str:
+    """Lê as threads ativas de um canal específico do Discord.
+
+    Use quando o usuário quiser ver apenas as threads de um canal em particular.
+
+    Args:
+        guild_id: ID numérico do servidor.
+        channel_id: ID numérico do canal pai.
+        quantidade: Quantas mensagens buscar por thread (1-100, padrão 100).
+    """
+    resultado = _fetch_threads(guild_id, channel_id=channel_id, quantidade=quantidade)
+    return f"=== Threads ativas do canal {channel_id} ===\n\n{resultado}"
 
 
 @mcp.tool()
